@@ -1,0 +1,163 @@
+### RabbitMQ重复结果处理思路(幂等性)
+一、常见问题包含(多次重复支付、短时间大量结果相同的请求)
+二、处理思路：
+    1.UUID+指纹码机制
+        指纹码:[保证唯一即可]可以由时间戳、服务器的唯一信息码、系统生成的随机值等拼接而成
+        利用数据库查询数据库中是否由重复的信息 高并发时由于数据库的写入瓶颈的缺陷 也可以采用分库分表处理
+    2.Redis【最优】
+        利用Redis执行setnx 天然存在幂等性
+
+
+### 优先级队列(0-255 越大越优先) 最好以[0-10]
+                                        [例]订单催付 大客户优先
+
+                                                             排序前
+                                                          7/3 3/7 6/5
+          [ 订单催付 ]            [    MQ    ]            [    消费者    ]           [    发短信    ]
+                                                          7/3 6/5 3/7
+                                                             排序后
+
+    【页面实现】http://localhost:15672/#/queues [add a queue]新建队列  arguments[参数 设置优先级] [x-max-priority 0-255]添加此参数配置项
+    【代码实现】 需在发送消息时[队列]和[消息]都需要添加优先级 见rabbitmq-demo  nine  设置优先级高先被消费
+
+
+### 惰性队列【消费者下线】(消息保存在内存中还是在磁盘上 正常情况保存在内存中 惰性队列情况下保存在磁盘中)
+    【页面实现】http://localhost:15672/#/queues [add a queue]新建队列  arguments[参数 设置队列模式] [x-queue-mode lazy]添加此参数配置项
+    【代码实现】Map<String,Object> map = new HashMap<String,Object>();
+              map.put("x-queue-mode","lazy");
+              /**
+              * @Description: 声明队列
+              * @Prame:
+              * 1.队列名称 QUEUE_NAME(hello)
+              * 2.队列内的消息是否需要持久化(true)  默认存储在内存中(false)
+              * 3.队列内消息是否共享(多个消费者) true允许 false不允许
+              * 4.是否自动删除(所有消费者断链后是否自动删除队列) true自动删除 false不自动删除
+              * 5.6.~ 其他参数(延迟消息 死信消息)
+              */
+              channel.queueDeclare(队列名称,是否持久化,是否共享给多个消费者,断连后一段时间是否自动删除,参数 map);
+
+
+###【RabbitMQ】集群搭建实战
+    前提:由三台机器 有RabbitMQ依赖 主机2.3由主机1复制得来(虚拟机)
+    步骤:
+        1.修改三台机器的Hostname(主机1为node1)
+            vim /etc/hostname  改为;node2 node3
+            重启
+        2.主机一修改hosts
+            vim /etc/hosts
+                改为:主机一ip node1
+                    主机二ip node2
+                    主机三ip node3
+        3.主机一修改三台主机的Cookie名称
+            scp /var/lib/rabbitmq/.erlang.cookie root@node2:/var/lib/rabbitmq/.erlang.cookie
+            scp /var/lib/rabbitmq/.erlang.cookie root@node3:/var/lib/rabbitmq/.erlang.cookie
+        4.三台机器重启RabbitMQ(RabbitMQ服务 Erlang虚拟机 RabbitMQ应用服务)
+            rabbitmq-server -detached
+        5.在第二台机器执行
+            rabbitmqctl stop_app //关闭RannbitMQ stop会关闭Erlang虚拟机 RannbitMQ stop_app仅关闭Rabbit服务
+            rabbitmqctl reset  //重置服务
+            rabbitmqctl join_cluster rabbit@node1  //加入到1号节点中
+            rabbitmqctl start_app  //重启服务
+        6.在第三台机器执行
+            rabbitmqctl stop_app //关闭RannbitMQ stop会关闭Erlang虚拟机 RannbitMQ stop_app仅关闭Rabbit服务
+            rabbitmqctl reset  //重置服务
+            rabbitmqctl join_cluster rabbit@node2  //加入到2号节点中
+            rabbitmqctl start_app  //重启服务
+        7.集群状态(查看当前集群状态)
+            rabbitctl cluster_statues
+        8.为集群创建账户
+            rabbitmqctl add_user admin 123  //创建账号
+            rabbitmqctl set_user_tags admin administrator  //设置账户角色
+            rabbitmqctl set_permissions -p "/" admin ".*" ".*" ".*"
+        9.接触集群节点(node2 node3分别执行)
+            rabbitmqctl stop_qpp  //关闭2.3的RabbitMQ服务
+            rabbitmqctl reset
+            rabbitmqctl start_app
+            rabbitmqctl cluster_status
+            rabbitmqctl forget_cluster_node rabbit@node2(在第一台机器上执行)  //以接触node2为例
+
+### 镜像队列(三台机器的信息不同步)
+    【页面实现】http://localhost:15672/#/users [policies]策略  [add/update a policies]添加一个策略
+            Name:               //名字
+            Pattern:^mirrior            //制定规则  例 以mirrior为前缀的队列(mirrior_hello)
+            Applyto:Exchange and queue  //应用范围
+            Definition: ha-mode  exactly   //备份模式 指定模式
+                        ha-params  2    //备份两份(主+备)
+                        ha-sync-mode  automatic  //自动完成
+            若两份中某一节点宕机 会自动备份一份 变为两份(原先的备成主 新增备份)
+
+### 负载均衡(Haproxy) nginx lvs 也可以实现负载均衡 (尚硅谷使用Haproxy + keepalive)
+
+### 联合交换机(Federation Exchange) (  北京 -> 深圳  )
+    一、需为没开机器都开启相应插件
+        rabbitmq-plugins enable rabbitmq_federation
+        rabbitmq-plugins enable rabbitmq_federation_management
+    (在node2下游节点创建 fed_exchange交换机 上游也需要有对应的fed_exchange)
+    二、在下游节点配置上游节点地址
+        ## 创建交换机
+        //队列名称
+        public static final String QUEUE_NAME="mirrior_hello";
+        //交换机名称
+        public static final String EXCHANGE_NAME="fed_exchange";
+
+        //接受消息
+        public static void main(String[] args) throws Exception {
+
+            //创建一个连接工厂
+            ConnectionFactory connectionFactory = new ConnectionFactory();
+            connectionFactory.setHost("localhost");  //下游节点的IP
+            //设置用户名 密码
+            connectionFactory.setUsername("admin");
+            connectionFactory.setPassword("123");
+
+            //创建连接
+            Connection connection = connectionFactory.newConnection();
+            //获取通信信道
+            Channel channel = connection.createChannel();
+            //声明交换机
+            channel.exchangeDeclare(EXCHANGE_NAME,"direct");
+            //声明队列
+            channel.queueDeclare("node2_queue",true,false,false,null);
+
+            //绑定
+            channel.queueBind("node2_queue",EXCHANGE_NAME,"routeKey");
+
+        }
+
+        ## 配置上游节点
+        【页面实现】http://localhost:15672/#/users [Federation Upstreams]  [add a new upstreams]
+            Name:node1-as-upstream  //名字  可自定义
+            URI:amqp://admin:123@node1  //上游账号密码@node1
+
+        ## 设置交换机策略
+        【页面实现】http://localhost:15672/#/users [policies]策略  [add/update a policies]添加一个策略
+            Name:exchange-policy     //名字  可自定义
+            Pattern:^fed_*           //制定规则
+            Applyto:Exchange         //应用范围
+            Definition:federation-upstream  node1-as-upstream
+            如果成功 会在侧边栏Federation Status显示当前状态
+
+        ## 设置队列策略
+        【页面实现】http://localhost:15672/#/users [policies]策略  [add/update a policies]添加一个策略
+            Name:queue-policy     //名字  可自定义
+            Pattern:^fed.*        //制定规则
+            Applyto:queue         //应用范围
+            Definition: federation-upstream  node1-as-upstream
+
+### Shovel ("铲子")可以将源端数据拉去到目标端
+    一、需为没开机器都开启相应插件(三台机器)
+        rabbitmq-plugins enable rabbitmq_shovel
+        rabbitmq-plugins enable rabbitmq_shovel_management
+    二、添加Shovel设置
+       【页面实现】http://localhost:15672/#/users [Shovel Management]shovel管理器  [add a new shovel]添加一个新的shovel
+            Name:Q1-to-Q2      //名字 可自定义
+            Source:
+                URI:amqp:admin:123@node1
+                QUEUE:Q1
+            Destination:
+                URI:amqp:admin:123@node2
+                QUEUE:Q2
+            若两份中某一节点宕机 会自动备份一份 变为两份(原先的备成主 新增备份)
+
+
+

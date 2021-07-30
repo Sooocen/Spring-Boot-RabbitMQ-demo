@@ -1,0 +1,10 @@
+spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: admin
+    password: 123
+    #开始RabbitMQ发布确认模式 具体回调方法 config.ConfirmCallBack
+    publisher-confirm-type: correlated
+    #RoutingKey路由不到 回退消息给生产者
+    publisher-returns: true
